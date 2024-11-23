@@ -1,0 +1,5 @@
+Les débuts du Machine Learning (apprentissage automatique) sont souvent associés à ceux de l'IA avec la création du célèbre 
+test de Turing en 1950. Mais c'est en 1959 que le terme “machine learning” apparait pour la 
+première fois, utilisé par Arthur Samuel pour son programme créé en 1952 capable d'apprendre à 
+jouer aux dames au fil des parties. Si vous souhaitez en savoir plus, vous pouvez me contacter sur dr.mokira@gmail.com et me retrouver sur www.linkedin.com.
+
