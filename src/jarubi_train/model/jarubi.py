@@ -1,10 +1,127 @@
+import re
 from math import sqrt
+from string import punctuation
+
+from num2words import num2words
+from librosa.filters import mel as librosa_mel_fn
+
 import torch
 from torch.autograd import Variable
 from torch import nn
 from torch.nn import functional as F
 from .layers import ConvNorm, LinearNorm
 from utils import to_gpu, get_mask_from_lengths
+
+
+SPACE = ' '
+ALPHABET = SPACE + "abcdefghijklmnopqrstuvwxyzàâçéèêëîïôœùûüÿ"
+NUMBERS = '0123456789'
+VOCAB = NUMBERS + ALPHABET + punctuation
+
+
+def num_to_text(num):
+    """
+    Function which allows to convert to any number
+    (integer, real) to text.
+
+    :param num: The number will be transcribe to text.
+    :type num: `int`|`float`
+    :rtype: `str`
+    """
+    res = num2words(num, lang='fr')
+    res = res.replace('-', SPACE)
+    return res
+
+
+class Text2Sequence:
+    @staticmethod
+    def _convert_email(email):
+        return email.replace('.', SPACE + 'point' + SPACE) \
+                    .replace('@', SPACE + 'arobase' + SPACE)
+
+    @staticmethod
+    def _domain_name(domain):
+        return domain.replace('www', 'trois' + SPACE + 'double v' + SPACE) \
+                     .replace('.', SPACE + 'point' + SPACE)
+
+    @staticmethod
+    def _special_char(character):
+        return character.replace('$', SPACE + 'dollar' + SPACE) \
+                        .replace('#', SPACE + 'hache tag' + SPACE) \
+                        .replace('&', SPACE + 'et' + SPACE) \
+                        .replace('%', SPACE + 'pourcent' + SPACE)
+
+    @staticmethod
+    def _real_number(string_val):
+        string_val = string_val.replace(',', '.')
+        num = float(string_val)
+        ret = num_to_text(num)
+        return ret
+
+    @staticmethod
+    def _int_number(string_val):
+        num = int(string_val)
+        ret = num_to_text(num)
+        return ret
+
+    @staticmethod
+    def _range(string_val):
+        numbers = re.findall(r'[0-9]+', string_val)
+        number = numbers[0]
+        rang_ = string_val.split(number)[1]
+        str_num = num_to_text(int(number))
+        return f"{str_num}{SPACE}{rang_}"
+    
+    _subtitution = [
+        ("“", "\""),
+        ("”", "\""),
+        ("\n", " "),
+    ]
+
+    _conversion_map = (
+        (re.compile(r"[a-z0-9._%+-]+@[a-z0-9]+\.[a-z]{2,}"), _convert_email),
+        (re.compile(r"[0-9a-z\._-]+\.[a-z]+"), _domain_name),
+        (re.compile(r"[$#&%]"), _special_char),
+        (re.compile(r"\d+(?:ème|er|ère){1}"), _range),
+        (re.compile(r"-?[0-9]+[\.,][0-9]+"), _real_number),
+        (re.compile(r'-?[0-9]+'), _int_number),
+    )
+
+    def __init__(self, vocab):
+        self._vocab = vocab
+
+    def forward(self, inputs):
+        if isinstance(inputs, list):
+            results = []
+            for text in inputs:
+                res = self.forward(text)
+                results.append(res)
+            return results
+        elif not isinstance(inputs, str):
+            raise TypeError("Input type must be string.")
+        text = inputs.lower()
+        for old, sub in self._subtitution:
+            text = text.replace(old, sub)
+        # tokens = nltk.wordpunct_tokenize(text)
+        for pattern, functional in self._conversion_map:
+            matches = pattern.findall(text)
+            for match in matches:
+                transformed = functional(match)
+                text = text.replace(match, transformed, 1)
+        # return text
+        sequence = []
+        for character in text:
+            try:
+                index = self._vocab.index(character)
+                sequence.append(index)
+            except (IndexError, ValueError) as e:
+                # print("-->", character, "?")
+                # continue
+                raise e
+        return sequence
+
+    def __call__(self, inputs):
+        return self.forward(inputs)
 
 
 class LocationLayer(nn.Module):
@@ -57,8 +174,8 @@ class Attention(nn.Module):
         processed_query = self.query_layer(query.unsqueeze(1))
         processed_attention_weights = self.location_layer(attention_weights_cat)
         energies = self.v(torch.tanh(
-            processed_query + processed_attention_weights + processed_memory))
-
+            processed_query + processed_attention_weights + processed_memory)
+        )
         energies = energies.squeeze(-1)
         return energies
 
@@ -140,7 +257,8 @@ class Postnet(nn.Module):
 
     def forward(self, x):
         for i in range(len(self.convolutions) - 1):
-            x = F.dropout(torch.tanh(self.convolutions[i](x)), 0.5, self.training)
+            x = F.dropout(torch.tanh(self.convolutions[i](x)),
+                          0.5, self.training)
         x = F.dropout(self.convolutions[-1](x), 0.5, self.training)
 
         return x
@@ -256,7 +374,8 @@ class Decoder(nn.Module):
         return decoder_input
 
     def initialize_decoder_states(self, memory, mask):
-        """ Initializes attention rnn states, decoder rnn states, attention
+        """
+        Initializes attention rnn states, decoder rnn states, attention
         weights, attention cumulative weights, attention context, stores memory
         and stores processed memory
         PARAMS
@@ -527,3 +646,67 @@ class Tacotron2(nn.Module):
             [mel_outputs, mel_outputs_postnet, gate_outputs, alignments])
 
         return outputs
+
+
+def dynamic_range_compression(x, C=1, clip_val=1e-5):
+    """
+    PARAMS
+    ------
+    C: compression factor
+    """
+    return torch.log(torch.clamp(x, min=clip_val) * C)
+
+
+def dynamic_range_decompression(x, C=1):
+    """
+    PARAMS
+    ------
+    C: compression factor used to compress
+    """
+    return torch.exp(x) / C
+
+
+class TacotronSTFT(nn.Module):
+    def __init__(self, filter_length=1024, hop_length=256, win_length=1024,
+                 n_mel_channels=80, sampling_rate=44100, mel_fmin=0.0,
+                 mel_fmax=8000.0):
+        super().__init__()
+        self.n_mel_channels = n_mel_channels
+        self.sampling_rate = sampling_rate
+        self.stft_fn = STFT(filter_length, hop_length, win_length)
+        mel_basis = librosa_mel_fn(
+            sampling_rate, filter_length, n_mel_channels, mel_fmin, mel_fmax)
+        mel_basis = torch.from_numpy(mel_basis).float()
+        self.register_buffer('mel_basis', mel_basis)
+
+    def spectral_normalize(self, magnitudes):
+        output = dynamic_range_compression(magnitudes)
+        return output
+
+    def spectral_denormalize(self, magnitudes):
+        output = dynamic_range_decompression(magnitudes)
+        return output
+
+    def mel_spectrogram(self, y):
+        """Computes mel-spectrograms from a batch of waves
+        PARAMS
+        ------
+        y: Variable(torch.FloatTensor) with shape (B, T) in range [-1, 1]
+
+        RETURNS
+        -------
+        mel_output: torch.FloatTensor of shape (B, n_mel_channels, T)
+        """
+        assert(torch.min(y.data) >= -1)
+        assert(torch.max(y.data) <= 1)
+
+        magnitudes, _phases = self.stft_fn.transform(y)
+        magnitudes = magnitudes.data
+        mel_output = torch.matmul(self.mel_basis, magnitudes)
+        mel_output = self.spectral_normalize(mel_output)
+        return mel_output
+
+
+class Algorithm(nn.Module):
+    def __init__(self):
+        super().__init__()
